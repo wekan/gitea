@@ -1,0 +1,108 @@
+name: Release all
+
+# Build every Gitea binary this fork releases and attach them to a GitHub
+# Release of wekan/gitea.
+#
+# WHY THIS EXISTS ALONGSIDE release-tag-version.yml. That workflow is upstream's
+# and it cannot run here: it wants `namespace-profile-gitea-release-binary`, a
+# self-hosted runner this fork does not have, and it syncs the result to
+# upstream's S3 bucket and Cloudflare R2 with credentials this fork does not
+# have either. It is left exactly as it is, because this is a FORK and every
+# line changed in an upstream file is a merge conflict later. This one is new
+# and runs on GitHub's own runners.
+#
+# WHAT IT BUILDS: `make release`, which is xgo cross-compiling four groups -
+#
+#   release-linux     LINUX_ARCHS from the Makefile: amd64, 386, arm-5, arm-6,
+#                     arm64, riscv64
+#   release-windows   windows/*, plus the gogit variant
+#   release-darwin    darwin-10.12 amd64 and arm64
+#   release-freebsd   freebsd/amd64
+#
+# and then release-sources, release-copy, release-compress (an .xz beside each
+# binary) and release-check (a .sha256 beside each file). Everything lands in
+# dist/release and everything in dist/release goes on the release.
+#
+# To fill in a release that is missing only some of that, use
+# release-all-missing.yml beside this one, which builds only the groups that are
+# short and uploads only the files that are absent.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build and attach to, e.g. v1.24.0-wekan (empty = newest git tag)'
+        required: false
+        type: string
+      publish:
+        description: 'Attach the binaries to the release'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: gitea-release-${{ inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build every binary
+    runs-on: ubuntu-24.04
+    # xgo builds four operating systems' worth of binaries, several of them
+    # statically linked with cgo. It is slow, and a hang should be stopped
+    # rather than left to burn the whole allowance.
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # tags, so the version can be derived from git describe
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-node@v4
+        with:
+          # package.json's engines field says what the frontend build needs.
+          node-version-file: package.json
+
+      - name: Resolve the release tag
+        id: ver
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.tag }}"
+          [ -n "$TAG" ] || TAG="$(git describe --tags --abbrev=0 2>/dev/null || git describe --tags --always)"
+          [ -n "$TAG" ] || { echo "::error::could not resolve a release tag"; exit 1; }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Release tag: $TAG"
+
+      - name: make release
+        run: make release
+
+      - name: What was built
+        run: |
+          set -euo pipefail
+          ls -1 dist/release | sed 's/^/  /'
+          n="$(ls -1 dist/release | wc -l | tr -d ' ')"
+          [ "$n" -gt 0 ] || { echo "::error::make release produced nothing in dist/release."; exit 1; }
+          echo "$n file(s) in dist/release."
+
+      - name: Attach everything to the release
+        if: ${{ inputs.publish != false }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=( dist/release/* )
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${assets[@]}" --clobber
+          else
+            gh release create "$TAG" "${assets[@]}" --title "$TAG" \
+              --notes "Gitea binaries built from the wekan/gitea fork by release-all.yml. Every file has a .sha256 beside it."
+          fi
+          echo "Published ${#assets[@]} file(s) to $TAG."

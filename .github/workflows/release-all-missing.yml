@@ -1,0 +1,185 @@
+name: Release all missing
+
+# Build only the groups of binaries a release does not already carry.
+#
+# WHY: `make release` cross-compiles four operating systems with xgo and takes
+# hours. When one group failed, or an upload did, the only way to get it was to
+# build all four again.
+#
+# HOW, and what the granularity is. The Makefile offers exactly four buildable
+# groups - release-linux, release-windows, release-darwin, release-freebsd - so
+# that is the granularity here, and a group is built when the release is missing
+# anything from it. It is NOT per architecture, because the per-architecture
+# file names come out of xgo rather than out of anything this repository states,
+# and a list of them written here would be a guess that goes stale the first
+# time xgo changes what `windows/*` expands to. A group is the unit the Makefile
+# gives, so a group is the unit this uses.
+#
+# A group counts as present when the release carries at least one
+# gitea-<version>-<os>-* asset for it AND every one of those assets has its
+# .sha256 beside it. The second half matters: a binary whose checksum upload
+# failed is a half-published release, and calling it present would leave it that
+# way.
+#
+# Uploads WITHOUT --clobber, and only files the release does not already have,
+# so a group that is rebuilt to obtain one missing architecture does not replace
+# the bytes of the ones that were already fine.
+#
+# Usage:
+#   gh workflow run release-all-missing.yml
+#   gh workflow run release-all-missing.yml -f tag=v1.24.0-wekan
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to complete (empty = newest git tag)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: gitea-release-${{ inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-missing:
+    name: build the missing groups
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: package.json
+
+      - name: Work out which groups are missing
+        id: plan
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.tag }}"
+          [ -n "$TAG" ] || TAG="$(git describe --tags --abbrev=0 2>/dev/null || git describe --tags --always)"
+          [ -n "$TAG" ] || { echo "::error::could not resolve a release tag"; exit 1; }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release view "$TAG" --json assets --jq '.assets[].name' | sort > existing.txt
+          else
+            echo "No release $TAG yet - every group is missing."
+            : > existing.txt
+          fi
+          echo "$TAG carries $(wc -l < existing.txt | tr -d ' ') asset(s)."
+
+          # For each group: does the release have any binary for it, and does
+          # every binary it has carry a .sha256? Either answer being no means
+          # build it.
+          targets=""
+          for group in linux windows darwin freebsd; do
+            # darwin binaries are named darwin-10.12-<arch> by the Makefile's
+            # xgo target, so match on the os token rather than an exact name.
+            bins="$(grep -E "^gitea-.*-${group}[.-]" existing.txt | grep -v '\.sha256$' | grep -v '\.xz$' || true)"
+            if [ -z "$bins" ]; then
+              echo "  $group: nothing on the release"
+              targets="$targets release-$group"
+              continue
+            fi
+            # A plain for-loop, not `while read <<EOF`: a heredoc inside a YAML
+            # block scalar only works because the terminator happens to land in
+            # column 0 after YAML strips the common indentation, and a later
+            # edit that changes the indentation would silently break it. Asset
+            # names have no spaces, so word splitting is exactly right here.
+            incomplete=""
+            for b in $bins; do
+              grep -qxF "${b}.sha256" existing.txt || incomplete="yes"
+            done
+            if [ -n "$incomplete" ]; then
+              echo "  $group: present but something has no .sha256"
+              targets="$targets release-$group"
+            else
+              echo "  $group: complete ($(printf '%s\n' "$bins" | wc -l | tr -d ' ') binaries)"
+            fi
+          done
+
+          echo "targets=${targets# }" >> "$GITHUB_OUTPUT"
+          {
+            echo "### $TAG"
+            echo ""
+            if [ -z "$targets" ]; then
+              echo "Nothing is missing - the release is complete."
+            else
+              echo "Building:\`${targets# }\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build only those groups
+        if: ${{ steps.plan.outputs.targets != '' }}
+        # The same targets `make release` runs, just not all of them. The
+        # post-processing steps come too: release-copy gathers the binaries into
+        # dist/release, release-compress puts an .xz beside each and
+        # release-check writes each .sha256 - without them the group would be
+        # published as bare binaries with no checksum, which is the state this
+        # workflow exists to repair.
+        run: |
+          set -euo pipefail
+          make frontend generate ${{ steps.plan.outputs.targets }} \
+               release-copy release-compress release-check
+          ls -1 dist/release | sed 's/^/  /'
+
+      - name: Upload what the release does not already have
+        if: ${{ steps.plan.outputs.targets != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.plan.outputs.tag }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          # Only the files that are genuinely absent. Rebuilding a group to
+          # obtain one architecture produces the whole group again, and
+          # re-uploading the ones that were already fine would replace good
+          # bytes for no reason - and would hide, rather than report, a release
+          # that changed under this run.
+          new=()
+          for f in dist/release/*; do
+            base="$(basename "$f")"
+            if grep -qxF "$base" existing.txt 2>/dev/null; then
+              continue
+            fi
+            new+=( "$f" )
+          done
+
+          if [ "${#new[@]}" -eq 0 ]; then
+            echo "::notice::$TAG already had every file the rebuilt groups produced."
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Nothing new to upload." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${new[@]}"
+          else
+            gh release create "$TAG" "${new[@]}" --title "$TAG" \
+              --notes "Gitea binaries built from the wekan/gitea fork. Created by release-all-missing.yml because no release existed for this tag."
+          fi
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Added ${#new[@]} file(s):" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' "${new[@]#dist/release/}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "Added ${#new[@]} file(s) to $TAG."
+
+      - name: Nothing was missing
+        if: ${{ steps.plan.outputs.targets == '' }}
+        run: echo "::notice::${{ steps.plan.outputs.tag }} is already complete - nothing was built."
