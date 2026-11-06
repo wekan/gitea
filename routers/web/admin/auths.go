@@ -10,7 +10,6 @@ import (
 	"net/url"
 	"regexp"
 	"strconv"
-	"strings"
 
 	"gitea.dev/models/auth"
 	"gitea.dev/models/db"
@@ -18,6 +17,7 @@ import (
 	"gitea.dev/modules/log"
 	"gitea.dev/modules/setting"
 	"gitea.dev/modules/templates"
+	"gitea.dev/modules/util"
 	"gitea.dev/modules/web"
 	auth_service "gitea.dev/services/auth"
 	"gitea.dev/services/auth/source/ldap"
@@ -175,15 +175,6 @@ func parseOAuth2Config(form forms.AuthenticationForm) *oauth2.Source {
 			EmailURL:   form.Oauth2EmailURL,
 			Tenant:     form.Oauth2Tenant,
 		}
-	} else {
-		customURLMapping = nil
-	}
-	var scopes []string
-	for s := range strings.SplitSeq(form.Oauth2Scopes, ",") {
-		s = strings.TrimSpace(s)
-		if s != "" {
-			scopes = append(scopes, s)
-		}
 	}
 
 	return &oauth2.Source{
@@ -193,7 +184,7 @@ func parseOAuth2Config(form forms.AuthenticationForm) *oauth2.Source {
 		OpenIDConnectAutoDiscoveryURL: form.OpenIDConnectAutoDiscoveryURL,
 		CustomURLMapping:              customURLMapping,
 		IconURL:                       form.Oauth2IconURL,
-		Scopes:                        scopes,
+		Scopes:                        util.SplitTrimSpace(form.Oauth2Scopes, ","),
 		RequiredClaimName:             form.Oauth2RequiredClaimName,
 		RequiredClaimValue:            form.Oauth2RequiredClaimValue,
 		GroupClaimName:                form.Oauth2GroupClaimName,
@@ -301,7 +292,7 @@ func NewAuthSourcePost(ctx *context.Context) {
 		return
 	}
 
-	if err := auth.CreateSource(ctx, &auth.Source{
+	if err := auth_service.CreateSource(ctx, &auth.Source{
 		Type:            auth.Type(form.Type),
 		Name:            form.Name,
 		IsActive:        form.IsActive,
@@ -419,7 +410,7 @@ func EditAuthSourcePost(ctx *context.Context) {
 	source.IsSyncEnabled = form.IsSyncEnabled
 	source.Cfg = config
 	source.TwoFactorPolicy = form.TwoFactorPolicy
-	if err := auth.UpdateSource(ctx, source); err != nil {
+	if err := auth_service.UpdateSource(ctx, source); err != nil {
 		if errExist, ok := errors.AsType[auth.ErrSourceAlreadyExist](err); ok {
 			ctx.Data["Err_Name"] = true
 			ctx.RenderWithErrDeprecated(ctx.Tr("admin.auths.login_source_exist", errExist.Name), tplAuthEdit, form)

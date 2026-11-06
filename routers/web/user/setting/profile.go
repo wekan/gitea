@@ -54,71 +54,55 @@ func Profile(ctx *context.Context) {
 
 // ProfilePost response for change user's profile
 func ProfilePost(ctx *context.Context) {
-	ctx.Data["Title"] = ctx.Tr("settings_title")
-	ctx.Data["PageIsSettingsProfile"] = true
-	ctx.Data["AllowedUserVisibilityModes"] = setting.Service.AllowedUserVisibilityModesSlice.ToVisibleTypeSlice()
-	ctx.Data["DisableGravatar"] = setting.Config().Picture.DisableGravatar.Value(ctx)
-
-	if ctx.HasError() {
-		ctx.HTML(http.StatusOK, tplSettingsProfile)
+	form := context.GetFetchActionForm[*forms.UpdateProfileForm](ctx)
+	if form == nil {
 		return
 	}
 
-	form := web.GetForm[*forms.UpdateProfileForm](ctx)
-
 	if form.Name != "" {
 		if user_model.IsFeatureDisabledWithLoginType(ctx.Doer, setting.UserFeatureChangeUsername) {
-			ctx.Flash.Error(ctx.Tr("user.form.change_username_disabled"))
-			ctx.Redirect(setting.AppSubURL + "/user/settings")
+			ctx.JSONErrorWithField(ctx.Tr("form.change_username_disabled"), "Name")
 			return
 		}
 		if err := user_service.RenameUser(ctx, ctx.Doer, form.Name, ctx.Doer); err != nil {
 			switch {
 			case user_model.IsErrUserIsNotLocal(err):
-				ctx.Flash.Error(ctx.Tr("form.username_change_not_local_user"))
+				ctx.JSONErrorWithField(ctx.Tr("form.username_change_not_local_user"), "Name")
 			case user_model.IsErrUserAlreadyExist(err):
-				ctx.Flash.Error(ctx.Tr("form.username_been_taken"))
+				ctx.JSONErrorWithField(ctx.Tr("form.username_been_taken"), "Name")
 			case db.IsErrNameReserved(err):
-				ctx.Flash.Error(ctx.Tr("user.form.name_reserved", form.Name))
+				ctx.JSONErrorWithField(ctx.Tr("user.form.name_reserved", form.Name), "Name")
 			case db.IsErrNamePatternNotAllowed(err):
-				ctx.Flash.Error(ctx.Tr("user.form.name_pattern_not_allowed", form.Name))
+				ctx.JSONErrorWithField(ctx.Tr("user.form.name_pattern_not_allowed", form.Name), "Name")
 			case db.IsErrNameCharsNotAllowed(err):
-				ctx.Flash.Error(ctx.Tr("user.form.name_chars_not_allowed", form.Name))
+				ctx.JSONErrorWithField(ctx.Tr("user.form.name_chars_not_allowed", form.Name), "Name")
 			default:
-				ctx.ServerError("RenameUser", err)
-				return
+				ctx.JSONErrorAuto(err)
 			}
-			ctx.Redirect(setting.AppSubURL + "/user/settings")
 			return
 		}
 	}
 
-	opts := &user_service.UpdateOptions{
+	if form.FullName != nil && user_model.IsFeatureDisabledWithLoginType(ctx.Doer, setting.UserFeatureChangeFullName) {
+		ctx.JSONErrorWithField(ctx.Tr("form.change_full_name_disabled"), "FullName")
+		return
+	}
+
+	if err := user_service.UpdateUser(ctx, ctx.Doer, &user_service.UpdateOptions{
 		KeepEmailPrivate:    optional.Some(form.KeepEmailPrivate),
+		FullName:            optional.FromPtr(form.FullName),
 		Description:         optional.Some(form.Description),
 		Website:             optional.Some(form.Website),
 		Location:            optional.Some(form.Location),
 		Visibility:          optional.Some(form.Visibility),
 		KeepActivityPrivate: optional.Some(form.KeepActivityPrivate),
-	}
-
-	if form.FullName != "" {
-		if user_model.IsFeatureDisabledWithLoginType(ctx.Doer, setting.UserFeatureChangeFullName) {
-			ctx.Flash.Error(ctx.Tr("user.form.change_full_name_disabled"))
-			ctx.Redirect(setting.AppSubURL + "/user/settings")
-			return
-		}
-		opts.FullName = optional.Some(form.FullName)
-	}
-
-	if err := user_service.UpdateUser(ctx, ctx.Doer, opts); err != nil {
-		ctx.ServerError("UpdateUser", err)
+	}); err != nil {
+		ctx.JSONErrorAuto(err)
 		return
 	}
 
-	log.Trace("User settings updated: %s", ctx.Doer.Name)
 	ctx.Flash.Success(ctx.Tr("settings.update_profile_success"))
-	ctx.Redirect(setting.AppSubURL + "/user/settings")
+	ctx.JSONRedirect(setting.AppSubURL + "/user/settings")
 }
 
 // UpdateAvatarSetting update user's avatar
@@ -214,8 +198,7 @@ func Organization(ctx *context.Context) {
 	}
 
 	ctx.Data["Orgs"] = orgs
-	pager := context.NewPagination(total, opts.PageSize, opts.Page, 5)
-	pager.AddParamFromRequest(ctx.Req)
+	pager := context.NewPagerBuilder(ctx).TotalCount(total).PerPageLimit(opts.PageSize).CurPage(opts.Page).Build()
 	ctx.Data["Page"] = pager
 	ctx.HTML(http.StatusOK, tplSettingsOrganization)
 }
@@ -277,7 +260,7 @@ func Repos(ctx *context.Context) {
 		}
 
 		userRepos, _, err := repo_model.GetUserRepositories(ctx, repo_model.SearchRepoOptions{
-			Actor:   ctxUser,
+			OwnerID: ctxUser.ID,
 			Private: true,
 			ListOptions: db.ListOptions{
 				Page:     1,
@@ -301,7 +284,7 @@ func Repos(ctx *context.Context) {
 		ctx.Data["Dirs"] = repoNames
 		ctx.Data["ReposMap"] = repos
 	} else {
-		repos, reposCount, err := repo_model.GetUserRepositories(ctx, repo_model.SearchRepoOptions{Actor: ctxUser, Private: true, ListOptions: opts})
+		repos, reposCount, err := repo_model.GetUserRepositories(ctx, repo_model.SearchRepoOptions{OwnerID: ctxUser.ID, Private: true, ListOptions: opts})
 		if err != nil {
 			ctx.ServerError("GetUserRepositories", err)
 			return
@@ -320,8 +303,7 @@ func Repos(ctx *context.Context) {
 		ctx.Data["Repos"] = repos
 	}
 	ctx.Data["ContextUser"] = ctxUser
-	pager := context.NewPagination(count, opts.PageSize, opts.Page, 5)
-	pager.AddParamFromRequest(ctx.Req)
+	pager := context.NewPagerBuilder(ctx).TotalCount(count).PerPageLimit(opts.PageSize).CurPage(opts.Page).Build()
 	ctx.Data["Page"] = pager
 	ctx.HTML(http.StatusOK, tplSettingsRepositories)
 }

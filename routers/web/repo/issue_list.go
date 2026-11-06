@@ -15,6 +15,7 @@ import (
 
 	"gitea.dev/models/db"
 	issues_model "gitea.dev/models/issues"
+	"gitea.dev/models/perm"
 	repo_model "gitea.dev/models/repo"
 	user_model "gitea.dev/models/user"
 	issue_indexer "gitea.dev/modules/indexer/issues"
@@ -43,8 +44,8 @@ func parseProjectIDsFromQuery(ctx *context.Context) []int64 {
 	return ctx.FormStringInt64s("project")
 }
 
-// SearchIssues searches for issues across the repositories that the user has access to
-func SearchIssues(ctx *context.Context) {
+// SearchGlobalIssues searches for issues across the repositories that the user has access to
+func SearchGlobalIssues(ctx *context.Context) {
 	before, since, err := context.GetQueryBeforeSince(ctx.Base)
 	if err != nil {
 		ctx.HTTPError(http.StatusUnprocessableEntity, err.Error())
@@ -233,7 +234,11 @@ func SearchRepoIssuesJSON(ctx *context.Context) {
 		}
 	}
 
-	isPull := common.ParseIssueFilterTypeIsPull(ctx.FormString("type"))
+	isPull, ok := common.ParseIssueFilterTypeIsPullWithPermission(ctx.Repo.Permission, ctx.FormString("type"))
+	if !ok {
+		ctx.HTTPError(http.StatusForbidden, "no permission to read issues or pulls")
+		return
+	}
 
 	// FIXME: we should be more efficient here
 	createdByID := getUserIDForFilter(ctx, "created_by")
@@ -309,7 +314,7 @@ func SearchRepoIssuesJSON(ctx *context.Context) {
 }
 
 func BatchDeleteIssues(ctx *context.Context) {
-	issues := getActionIssues(ctx)
+	issues := getActionIssues(ctx, perm.AccessModeWrite)
 	if ctx.Written() {
 		return
 	}
@@ -324,7 +329,7 @@ func BatchDeleteIssues(ctx *context.Context) {
 
 // UpdateIssueStatus change issue's status
 func UpdateIssueStatus(ctx *context.Context) {
-	issues := getActionIssues(ctx)
+	issues := getActionIssues(ctx, perm.AccessModeWrite)
 	if ctx.Written() {
 		return
 	}
@@ -380,10 +385,11 @@ func prepareIssueFilterExclusiveOrderScopes(ctx *context.Context, allLabels []*i
 	ctx.Data["ExclusiveLabelScopes"] = scopes
 }
 
-func renderMilestones(ctx *context.Context) {
+func renderMilestones(ctx *context.Context, projectID int64) {
 	// Get milestones
 	milestones, err := db.Find[issues_model.Milestone](ctx, issues_model.FindMilestoneOptions{
-		RepoID: ctx.Repo.Repository.ID,
+		RepoID:    ctx.Repo.Repository.ID,
+		ProjectID: projectID,
 	})
 	if err != nil {
 		ctx.ServerError("GetAllRepoMilestones", err)
@@ -509,7 +515,7 @@ func prepareIssueFilterAndList(ctx *context.Context, milestoneID int64, projectI
 		total = util.Iif(isShowClosed.Value(), issueStats.ClosedCount, issueStats.OpenCount)
 	}
 	page := max(ctx.FormInt("page"), 1)
-	pager := context.NewPagination(total, setting.UI.IssuePagingNum, page, 5)
+	pager := context.NewPagerBuilder(ctx).TotalCount(total).PerPageLimit(setting.UI.IssuePagingNum).CurPage(page).Build()
 
 	// prepare real issue list:
 	var issues issues_model.IssueList
@@ -519,7 +525,7 @@ func prepareIssueFilterAndList(ctx *context.Context, milestoneID int64, projectI
 		// In either case, no need to use keyword anymore
 		searchResult, err := db_indexer.GetIndexer().FindWithIssueOptions(ctx, &issues_model.IssuesOptions{
 			Paginator: &db.ListOptions{
-				Page:     pager.Paginater.Current(),
+				Page:     pager.Paginator.Current(),
 				PageSize: setting.UI.IssuePagingNum,
 			},
 			RepoIDs:           []int64{repo.ID},
@@ -624,7 +630,7 @@ func prepareIssueFilterAndList(ctx *context.Context, milestoneID int64, projectI
 	showArchivedLabels := ctx.FormBool("archived_labels")
 	ctx.Data["ShowArchivedLabels"] = showArchivedLabels
 	ctx.Data["PinnedIssues"] = pinned
-	ctx.Data["IsRepoAdmin"] = ctx.IsSigned && (ctx.Repo.Permission.IsAdmin() || ctx.Doer.IsAdmin)
+	ctx.Data["IsRepoAdmin"] = ctx.Repo.Permission.IsAdmin()
 	ctx.Data["IssueStats"] = issueStats
 	ctx.Data["OpenCount"] = issueStats.OpenCount
 	ctx.Data["ClosedCount"] = issueStats.ClosedCount
@@ -645,7 +651,6 @@ func prepareIssueFilterAndList(ctx *context.Context, milestoneID int64, projectI
 	default:
 		ctx.Data["State"] = "open"
 	}
-	pager.AddParamFromRequest(ctx.Req)
 	ctx.Data["Page"] = pager
 }
 
@@ -680,7 +685,7 @@ func Issues(ctx *context.Context) {
 		return
 	}
 
-	renderMilestones(ctx)
+	renderMilestones(ctx, 0)
 	if ctx.Written() {
 		return
 	}

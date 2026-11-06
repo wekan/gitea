@@ -25,6 +25,7 @@ import (
 	issue_service "gitea.dev/services/issue"
 	notify_service "gitea.dev/services/notify"
 	pull_service "gitea.dev/services/pull"
+	release_service "gitea.dev/services/release"
 )
 
 // pushQueue represents a queue to handle update pull request tests
@@ -96,13 +97,8 @@ func pushQueueHandleUpdates(optsList []*repo_module.PushUpdateOptions) error {
 
 		if opts.RefFullName.IsTag() {
 			if pusher == nil || pusher.ID != opts.PusherID {
-				if opts.PusherID == user_model.ActionsUserID {
-					pusher = user_model.NewActionsUser()
-				} else {
-					var err error
-					if pusher, err = user_model.GetUserByID(ctx, opts.PusherID); err != nil {
-						return err
-					}
+				if _, pusher, err = user_model.GetPossibleUserByID(ctx, opts.PusherID); err != nil {
+					return err
 				}
 			}
 			tagName := opts.RefFullName.TagName()
@@ -143,13 +139,8 @@ func pushQueueHandleUpdates(optsList []*repo_module.PushUpdateOptions) error {
 			}
 		} else if opts.RefFullName.IsBranch() {
 			if pusher == nil || pusher.ID != opts.PusherID {
-				if opts.PusherID == user_model.ActionsUserID {
-					pusher = user_model.NewActionsUser()
-				} else {
-					var err error
-					if pusher, err = user_model.GetUserByID(ctx, opts.PusherID); err != nil {
-						return err
-					}
+				if _, pusher, err = user_model.GetPossibleUserByID(ctx, opts.PusherID); err != nil {
+					return err
 				}
 			}
 
@@ -396,6 +387,7 @@ func pushUpdateAddTags(ctx context.Context, repo *repo_model.Repository, gitRepo
 
 			newReleases = append(newReleases, rel)
 		} else {
+			wasLatestCandidate := rel.CanBeLatest()
 			rel.Sha1 = commit.ID.String()
 			rel.CreatedUnix = createdUnix
 			if rel.IsTag {
@@ -411,6 +403,9 @@ func pushUpdateAddTags(ctx context.Context, repo *repo_model.Repository, gitRepo
 			rel.PublisherID = pusher.ID
 			if err = repo_model.UpdateRelease(ctx, rel); err != nil {
 				return fmt.Errorf("Update: %w", err)
+			}
+			if err = release_service.UpdateLatestRelease(ctx, repo, rel, wasLatestCandidate, ""); err != nil {
+				return fmt.Errorf("pushUpdateAddTags: %w", err)
 			}
 		}
 	}

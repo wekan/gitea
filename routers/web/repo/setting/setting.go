@@ -11,8 +11,10 @@ import (
 	"strings"
 	"time"
 
+	audit_model "gitea.dev/models/audit"
 	"gitea.dev/models/db"
 	"gitea.dev/models/organization"
+	access_model "gitea.dev/models/perm/access"
 	repo_model "gitea.dev/models/repo"
 	unit_model "gitea.dev/models/unit"
 	user_model "gitea.dev/models/user"
@@ -22,6 +24,7 @@ import (
 	"gitea.dev/modules/indexer/stats"
 	"gitea.dev/modules/lfs"
 	"gitea.dev/modules/log"
+	"gitea.dev/modules/markup"
 	"gitea.dev/modules/setting"
 	"gitea.dev/modules/structs"
 	"gitea.dev/modules/templates"
@@ -30,6 +33,7 @@ import (
 	"gitea.dev/modules/web"
 	repo_router "gitea.dev/routers/web/repo"
 	actions_service "gitea.dev/services/actions"
+	"gitea.dev/services/audit"
 	"gitea.dev/services/context"
 	"gitea.dev/services/forms"
 	"gitea.dev/services/migrations"
@@ -55,6 +59,14 @@ type selectOption struct {
 	Selected bool
 }
 
+func canManageRepoDangerZone(ctx *context.Context) bool {
+	if !access_model.CanDoerManageRepoDangerZone(ctx, ctx.Doer, ctx.Repo.Repository, &ctx.Repo.Permission) {
+		ctx.JSONErrorNotFound()
+		return false
+	}
+	return true
+}
+
 // SettingsCtxData is a middleware that sets all the general context data for the
 // settings template.
 func SettingsCtxData(ctx *context.Context) {
@@ -67,6 +79,7 @@ func SettingsCtxData(ctx *context.Context) {
 	ctx.Data["DefaultMirrorInterval"] = setting.Mirror.DefaultInterval
 	ctx.Data["MinimumMirrorInterval"] = setting.Mirror.MinInterval
 	ctx.Data["CanConvertFork"] = ctx.Repo.Repository.IsFork && ctx.Doer.CanCreateRepoIn(ctx.Repo.Repository.Owner)
+	ctx.Data["CanManagerDangerZone"] = access_model.CanDoerManageRepoDangerZone(ctx, ctx.Doer, ctx.Repo.Repository, &ctx.Repo.Permission)
 
 	signing, _ := git.GetSigningKey(ctx)
 	ctx.Data["SigningKeyAvailable"] = signing != nil
@@ -385,9 +398,9 @@ func handleSettingsPostPushMirrorSync(ctx *context.Context) {
 		return
 	}
 
-	m, _, _ := repo_model.GetPushMirrorByIDAndRepoID(ctx, form.PushMirrorID, repo.ID)
-	if m == nil {
-		ctx.NotFound(nil)
+	m, err := repo_model.GetPushMirrorByRepoID(ctx, repo.ID, form.PushMirrorID)
+	if err != nil {
+		ctx.ServerError("GetPushMirrorByRepoID", err)
 		return
 	}
 
@@ -416,9 +429,9 @@ func handleSettingsPostPushMirrorUpdate(ctx *context.Context) {
 		return
 	}
 
-	m, _, _ := repo_model.GetPushMirrorByIDAndRepoID(ctx, form.PushMirrorID, repo.ID)
-	if m == nil {
-		ctx.NotFound(nil)
+	m, err := repo_model.GetPushMirrorByRepoID(ctx, repo.ID, form.PushMirrorID)
+	if err != nil {
+		ctx.ServerError("GetPushMirrorByRepoID", err)
 		return
 	}
 
@@ -448,23 +461,14 @@ func handleSettingsPostPushMirrorRemove(ctx *context.Context) {
 		return
 	}
 
-	// This section doesn't require repo_name/RepoName to be set in the form, don't show it
-	// as an error on the UI for this action
-	ctx.Data["Err_RepoName"] = nil
-
-	m, _, _ := repo_model.GetPushMirrorByIDAndRepoID(ctx, form.PushMirrorID, repo.ID)
-	if m == nil {
-		ctx.NotFound(nil)
+	m, err := repo_model.GetPushMirrorByRepoID(ctx, repo.ID, form.PushMirrorID)
+	if err != nil {
+		ctx.ServerError("GetPushMirrorByRepoID", err)
 		return
 	}
 
-	if err := mirror_service.RemovePushMirrorRemote(ctx, m); err != nil {
-		ctx.ServerError("RemovePushMirrorRemote", err)
-		return
-	}
-
-	if err := repo_model.DeletePushMirrors(ctx, repo_model.PushMirrorOptions{ID: m.ID, RepoID: m.RepoID}); err != nil {
-		ctx.ServerError("DeletePushMirrorByID", err)
+	if err := mirror_service.DeleteRepoPushMirrorByID(ctx, repo.ID, m.ID); err != nil {
+		ctx.ServerError("DeleteRepoPushMirrorByID", err)
 		return
 	}
 
@@ -525,12 +529,11 @@ func handleSettingsPostPushMirrorAdd(ctx *context.Context) {
 	}
 
 	if err := mirror_service.AddPushMirrorRemote(ctx, m, address); err != nil {
-		if err := repo_model.DeletePushMirrors(ctx, repo_model.PushMirrorOptions{ID: m.ID, RepoID: m.RepoID}); err != nil {
-			log.Error("DeletePushMirrors %v", err)
-		}
 		ctx.ServerError("AddPushMirrorRemote", err)
 		return
 	}
+
+	audit.Record(ctx, audit_model.RepositoryMirrorPushAdd, repo, "mirror_id", m.ID, "remote_address", m.RemoteAddress)
 
 	ctx.Flash.Success(ctx.Tr("repo.settings.update_settings_success"))
 	ctx.Redirect(repo.Link() + "/settings")
@@ -554,10 +557,6 @@ func handleSettingsPostAdvanced(ctx *context.Context) {
 	var units []repo_model.RepoUnit
 	var deleteUnitTypes []unit_model.Type
 
-	// This section doesn't require repo_name/RepoName to be set in the form, don't show it
-	// as an error on the UI for this action
-	ctx.Data["Err_RepoName"] = nil
-
 	if repo.CloseIssuesViaCommitInAnyBranch != form.EnableCloseIssuesViaCommitInAnyBranch {
 		repo.CloseIssuesViaCommitInAnyBranch = form.EnableCloseIssuesViaCommitInAnyBranch
 		repoChanged = true
@@ -571,8 +570,7 @@ func handleSettingsPostAdvanced(ctx *context.Context) {
 
 	if form.EnableWiki && form.EnableExternalWiki && !unit_model.TypeExternalWiki.UnitGlobalDisabled() {
 		if !validation.IsValidURL(form.ExternalWikiURL) {
-			ctx.Flash.Error(ctx.Tr("repo.settings.external_wiki_url_error"))
-			ctx.Redirect(repo.Link() + "/settings")
+			ctx.JSONError(ctx.Tr("repo.settings.external_wiki_url_error"))
 			return
 		}
 
@@ -595,19 +593,21 @@ func handleSettingsPostAdvanced(ctx *context.Context) {
 	if form.DefaultWikiBranch != "" {
 		if err := wiki_service.ChangeDefaultWikiBranch(ctx, repo, form.DefaultWikiBranch); err != nil {
 			log.Error("ChangeDefaultWikiBranch failed, err: %v", err)
-			ctx.Flash.Warning(ctx.Tr("repo.settings.failed_to_change_default_wiki_branch"))
+			ctx.Flash.Warning(ctx.Tr("repo.settings.failed_to_change_default_wiki_branch")) // skip the error, continue, and reload page
 		}
 	}
 
-	if form.EnableIssues && form.EnableExternalTracker && !unit_model.TypeExternalTracker.UnitGlobalDisabled() {
-		if !validation.IsValidURL(form.ExternalTrackerURL) {
-			ctx.Flash.Error(ctx.Tr("repo.settings.external_tracker_url_error"))
-			ctx.Redirect(repo.Link() + "/settings")
+	if form.EnableExternalTracker && !unit_model.TypeExternalTracker.UnitGlobalDisabled() {
+		if (!form.EnableInternalTracker || form.ExternalTrackerURL != "") && !validation.IsValidURL(form.ExternalTrackerURL) {
+			ctx.JSONError(ctx.Tr("repo.settings.external_tracker_url_error"))
 			return
 		}
-		if len(form.TrackerURLFormat) != 0 && !validation.IsValidExternalTrackerURLFormat(form.TrackerURLFormat) {
-			ctx.Flash.Error(ctx.Tr("repo.settings.tracker_url_format_error"))
-			ctx.Redirect(repo.Link() + "/settings")
+		if form.TrackerURLFormat != "" && !validation.IsValidExternalTrackerURLFormat(form.TrackerURLFormat) {
+			ctx.JSONError(ctx.Tr("repo.settings.tracker_url_format_error"))
+			return
+		}
+		if form.EnableInternalTracker && (form.TrackerIssueStyle == "" || form.TrackerIssueStyle == markup.IssueNameStyleNumeric) {
+			ctx.JSONError(ctx.Tr("repo.settings.tracker_issue_style_desc"))
 			return
 		}
 		units = append(units, newRepoUnit(repo, unit_model.TypeExternalTracker, &repo_model.ExternalTrackerConfig{
@@ -616,21 +616,18 @@ func handleSettingsPostAdvanced(ctx *context.Context) {
 			ExternalTrackerStyle:         form.TrackerIssueStyle,
 			ExternalTrackerRegexpPattern: form.ExternalTrackerRegexpPattern,
 		}))
-		deleteUnitTypes = append(deleteUnitTypes, unit_model.TypeIssues)
-	} else if form.EnableIssues && !form.EnableExternalTracker && !unit_model.TypeIssues.UnitGlobalDisabled() {
+	} else {
+		deleteUnitTypes = append(deleteUnitTypes, unit_model.TypeExternalTracker)
+	}
+
+	if form.EnableInternalTracker && !unit_model.TypeIssues.UnitGlobalDisabled() {
 		units = append(units, newRepoUnit(repo, unit_model.TypeIssues, &repo_model.IssuesConfig{
 			EnableTimetracker:                form.EnableTimetracker,
 			AllowOnlyContributorsToTrackTime: form.AllowOnlyContributorsToTrackTime,
 			EnableDependencies:               form.EnableIssueDependencies,
 		}))
-		deleteUnitTypes = append(deleteUnitTypes, unit_model.TypeExternalTracker)
 	} else {
-		if !unit_model.TypeExternalTracker.UnitGlobalDisabled() {
-			deleteUnitTypes = append(deleteUnitTypes, unit_model.TypeExternalTracker)
-		}
-		if !unit_model.TypeIssues.UnitGlobalDisabled() {
-			deleteUnitTypes = append(deleteUnitTypes, unit_model.TypeIssues)
-		}
+		deleteUnitTypes = append(deleteUnitTypes, unit_model.TypeIssues)
 	}
 
 	if form.EnableProjects && !unit_model.TypeProjects.UnitGlobalDisabled() {
@@ -669,12 +666,16 @@ func handleSettingsPostAdvanced(ctx *context.Context) {
 			DefaultUpdateStyle:            defaultUpdateStyle,
 			DefaultDeleteBranchAfterMerge: form.DefaultDeleteBranchAfterMerge,
 			DefaultMergeStyle:             repo_model.MergeStyle(form.PullsDefaultMergeStyle),
+			DefaultSquashMergeMessage:     util.IfZero(repo_model.SquashMergeMessage(form.PullsDefaultSquashMergeMessage), repo_model.DefaultPullRequestsConfig().DefaultSquashMergeMessage),
 			DefaultAllowMaintainerEdit:    form.DefaultAllowMaintainerEdit,
 			DefaultTargetBranch:           strings.TrimSpace(form.DefaultTargetBranch),
 		}
 		if err := prConfig.ValidateUpdateSettings(); err != nil {
-			ctx.Flash.Error(err.Error())
-			ctx.Redirect(repo.Link() + "/settings")
+			ctx.JSONErrorAuto(err)
+			return
+		}
+		if !prConfig.DefaultSquashMergeMessage.IsValid() {
+			ctx.JSONErrorAuto(util.NewInvalidArgumentErrorf("invalid default squash merge message: %s", prConfig.DefaultSquashMergeMessage))
 			return
 		}
 		units = append(units, newRepoUnit(repo, unit_model.TypePullRequests, prConfig))
@@ -683,8 +684,7 @@ func handleSettingsPostAdvanced(ctx *context.Context) {
 	}
 
 	if len(units) == 0 {
-		ctx.Flash.Error(ctx.Tr("repo.settings.update_settings_no_unit"))
-		ctx.Redirect(ctx.Repo.RepoLink + "/settings")
+		ctx.JSONError(ctx.Tr("repo.settings.update_settings_no_unit"))
 		return
 	}
 
@@ -698,10 +698,9 @@ func handleSettingsPostAdvanced(ctx *context.Context) {
 			return
 		}
 	}
-	log.Trace("Repository advanced settings updated: %s/%s", ctx.Repo.Owner.Name, repo.Name)
 
 	ctx.Flash.Success(ctx.Tr("repo.settings.update_settings_success"))
-	ctx.Redirect(ctx.Repo.RepoLink + "/settings")
+	ctx.JSONRedirect("")
 }
 
 func handleSettingsPostSigning(ctx *context.Context) {
@@ -714,6 +713,9 @@ func handleSettingsPostSigning(ctx *context.Context) {
 			ctx.ServerError("UpdateRepositoryColsNoAutoTime", err)
 			return
 		}
+
+		audit.Record(ctx, audit_model.RepositorySigningVerification, repo, "trust_model", repo.TrustModel.String())
+
 		log.Trace("Repository signing settings updated: %s/%s", ctx.Repo.Owner.Name, repo.Name)
 	}
 
@@ -774,13 +776,13 @@ func handleSettingsPostAdminIndex(ctx *context.Context) {
 }
 
 func handleSettingsPostConvert(ctx *context.Context) {
-	form := web.GetForm[*forms.RepoSettingForm](ctx)
-	repo := ctx.Repo.Repository
-	if !ctx.Repo.Permission.IsOwner() {
-		ctx.JSONErrorNotFound()
+	if !canManageRepoDangerZone(ctx) {
 		return
 	}
-	if repo.Name != form.RepoName {
+
+	form := web.GetForm[*forms.RepoSettingForm](ctx)
+	repo := ctx.Repo.Repository
+	if repo.FullName() != form.RepoName {
 		ctx.JSONError(ctx.Tr("form.enterred_invalid_repo_name"))
 		return
 	}
@@ -794,27 +796,30 @@ func handleSettingsPostConvert(ctx *context.Context) {
 	if _, err := repo_service.CleanUpMigrateInfo(ctx, repo); err != nil {
 		ctx.ServerError("CleanUpMigrateInfo", err)
 		return
-	} else if err = repo_model.DeleteMirrorByRepoID(ctx, ctx.Repo.Repository.ID); err != nil {
+	} else if err = repo_model.DeleteRepoPullMirror(ctx, ctx.Repo.Repository.ID); err != nil {
 		ctx.ServerError("DeleteMirrorByRepoID", err)
 		return
 	}
+
+	audit.Record(ctx, audit_model.RepositoryConvertMirror, repo)
+
 	log.Trace("Repository converted from mirror to regular: %s", repo.FullName())
 	ctx.Flash.Success(ctx.Tr("repo.settings.convert_succeed"))
 	ctx.JSONRedirect(repo.Link())
 }
 
 func handleSettingsPostConvertFork(ctx *context.Context) {
-	form := web.GetForm[*forms.RepoSettingForm](ctx)
-	repo := ctx.Repo.Repository
-	if !ctx.Repo.Permission.IsOwner() {
-		ctx.JSONErrorNotFound()
+	if !canManageRepoDangerZone(ctx) {
 		return
 	}
+
+	form := web.GetForm[*forms.RepoSettingForm](ctx)
+	repo := ctx.Repo.Repository
 	if err := repo.LoadOwner(ctx); err != nil {
 		ctx.ServerError("Convert Fork", err)
 		return
 	}
-	if repo.Name != form.RepoName {
+	if repo.FullName() != form.RepoName {
 		ctx.JSONError(ctx.Tr("form.enterred_invalid_repo_name"))
 		return
 	}
@@ -844,13 +849,13 @@ func handleSettingsPostConvertFork(ctx *context.Context) {
 }
 
 func handleSettingsPostTransfer(ctx *context.Context) {
-	form := web.GetForm[*forms.RepoSettingForm](ctx)
-	repo := ctx.Repo.Repository
-	if !ctx.Repo.Permission.IsOwner() {
-		ctx.JSONErrorNotFound()
+	if !canManageRepoDangerZone(ctx) {
 		return
 	}
-	if repo.Name != form.RepoName {
+
+	form := web.GetForm[*forms.RepoSettingForm](ctx)
+	repo := ctx.Repo.Repository
+	if repo.FullName() != form.RepoName {
 		ctx.JSONError(ctx.Tr("form.enterred_invalid_repo_name"))
 		return
 	}
@@ -908,12 +913,11 @@ func handleSettingsPostTransfer(ctx *context.Context) {
 }
 
 func handleSettingsPostCancelTransfer(ctx *context.Context) {
-	repo := ctx.Repo.Repository
-	if !ctx.Repo.Permission.IsOwner() {
-		ctx.HTTPError(http.StatusNotFound)
+	if !canManageRepoDangerZone(ctx) {
 		return
 	}
 
+	repo := ctx.Repo.Repository
 	repoTransfer, err := repo_model.GetPendingRepositoryTransfer(ctx, ctx.Repo.Repository)
 	if err != nil {
 		if repo_model.IsErrNoPendingTransfer(err) {
@@ -936,13 +940,13 @@ func handleSettingsPostCancelTransfer(ctx *context.Context) {
 }
 
 func handleSettingsPostDelete(ctx *context.Context) {
-	form := web.GetForm[*forms.RepoSettingForm](ctx)
-	repo := ctx.Repo.Repository
-	if !ctx.Repo.Permission.IsOwner() {
-		ctx.JSONErrorNotFound()
+	if !canManageRepoDangerZone(ctx) {
 		return
 	}
-	if repo.Name != form.RepoName {
+
+	form := web.GetForm[*forms.RepoSettingForm](ctx)
+	repo := ctx.Repo.Repository
+	if repo.FullName() != form.RepoName {
 		ctx.JSONError(ctx.Tr("form.enterred_invalid_repo_name"))
 		return
 	}
@@ -963,13 +967,12 @@ func handleSettingsPostDelete(ctx *context.Context) {
 }
 
 func handleSettingsPostDeleteWiki(ctx *context.Context) {
-	form := web.GetForm[*forms.RepoSettingForm](ctx)
-	repo := ctx.Repo.Repository
-	if !ctx.Repo.Permission.IsOwner() {
-		ctx.JSONErrorNotFound()
+	if !canManageRepoDangerZone(ctx) {
 		return
 	}
-	if repo.Name != form.RepoName {
+	form := web.GetForm[*forms.RepoSettingForm](ctx)
+	repo := ctx.Repo.Repository
+	if repo.FullName() != form.RepoName {
 		ctx.JSONError(ctx.Tr("form.enterred_invalid_repo_name"))
 		return
 	}
@@ -985,12 +988,11 @@ func handleSettingsPostDeleteWiki(ctx *context.Context) {
 }
 
 func handleSettingsPostArchive(ctx *context.Context) {
-	repo := ctx.Repo.Repository
-	if !ctx.Repo.Permission.IsOwner() {
-		ctx.HTTPError(http.StatusForbidden)
+	if !canManageRepoDangerZone(ctx) {
 		return
 	}
 
+	repo := ctx.Repo.Repository
 	if repo.IsMirror {
 		ctx.Flash.Error(ctx.Tr("repo.settings.archive.error_ismirror"))
 		ctx.Redirect(ctx.Repo.RepoLink + "/settings")
@@ -1011,6 +1013,8 @@ func handleSettingsPostArchive(ctx *context.Context) {
 	// update issue indexer
 	issue_indexer.UpdateRepoIndexer(ctx, repo.ID)
 
+	audit.Record(ctx, audit_model.RepositoryArchive, repo)
+
 	ctx.Flash.Success(ctx.Tr("repo.settings.archive.success"))
 
 	log.Trace("Repository was archived: %s/%s", ctx.Repo.Owner.Name, repo.Name)
@@ -1018,12 +1022,11 @@ func handleSettingsPostArchive(ctx *context.Context) {
 }
 
 func handleSettingsPostUnarchive(ctx *context.Context) {
-	repo := ctx.Repo.Repository
-	if !ctx.Repo.Permission.IsOwner() {
-		ctx.HTTPError(http.StatusForbidden)
+	if !canManageRepoDangerZone(ctx) {
 		return
 	}
 
+	repo := ctx.Repo.Repository
 	if err := repo_model.SetArchiveRepoState(ctx, repo, false); err != nil {
 		log.Error("Tried to unarchive a repo: %s", err)
 		ctx.Flash.Error(ctx.Tr("repo.settings.unarchive.error"))
@@ -1040,6 +1043,8 @@ func handleSettingsPostUnarchive(ctx *context.Context) {
 	// update issue indexer
 	issue_indexer.UpdateRepoIndexer(ctx, repo.ID)
 
+	audit.Record(ctx, audit_model.RepositoryUnarchive, repo)
+
 	ctx.Flash.Success(ctx.Tr("repo.settings.unarchive.success"))
 
 	log.Trace("Repository was un-archived: %s/%s", ctx.Repo.Owner.Name, repo.Name)
@@ -1047,6 +1052,10 @@ func handleSettingsPostUnarchive(ctx *context.Context) {
 }
 
 func handleSettingsPostVisibility(ctx *context.Context) {
+	if !canManageRepoDangerZone(ctx) {
+		return
+	}
+
 	repo := ctx.Repo.Repository
 	if repo.IsFork {
 		ctx.JSONError(ctx.Tr("repo.settings.visibility.fork_error"))
@@ -1055,7 +1064,7 @@ func handleSettingsPostVisibility(ctx *context.Context) {
 
 	private := ctx.FormOptionalBool("private").ValueOrDefault(true) // default to true for privacy & safety
 
-	// when ForcePrivate enabled, you could change public repo to private, but only admin users can change private to public
+	// when ForcePrivate enabled, you could change public repo to private, only site admin users can change private to public
 	if !private && setting.Repository.ForcePrivate && !ctx.Doer.IsAdmin {
 		ctx.JSONError(ctx.Tr("form.repository_force_private"))
 		return
