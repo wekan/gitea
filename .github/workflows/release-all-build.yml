@@ -1,0 +1,225 @@
+name: Release All build
+
+# Shared by "Release All" (release-all.yml) and "Release All Missing"
+# (release-all-missing.yml) of this fork. It is called, never run by itself.
+#
+# WHAT IT BUILDS: what upstream's release-tag-version.yml puts on a go-gitea/gitea
+# release, the same way - `make deps-frontend deps-backend`, then `make release`:
+#
+#   tools/build-release.sh   every platform in its RELEASE_PLATFORMS_DEFAULT
+#                            (linux amd64, arm-5, arm-6, arm64, riscv64;
+#                            windows amd64, arm64; darwin amd64, arm64;
+#                            freebsd amd64), Go's own cross compilation
+#   release-compress         an .xz beside each binary
+#   release-sources          gitea-src-<version>.tar.gz
+#   release-check            a .sha256 beside every file
+#
+# and, like upstream, a keyless cosign signature (<file>.sigstore.json) of every
+# file, which needs only this workflow's OIDC token. Upstream's GPG .asc files
+# need upstream's private key, so they are not made here. The platform list is
+# read from tools/build-release.sh, so it follows upstream after every merge.
+#
+# VERSION: the Makefile names files after GITHUB_REF_NAME when GITHUB_REF_TYPE is
+# "tag", and `$(subst v,,...)` drops EVERY "v" in it - so the tag must have no
+# "v" after the first character ("dev" would become "de"). Without a tag input
+# the tag is v<upstream version>-wekan-<date>-<commit>, the upstream version
+# being the newest go-gitea/gitea tag this commit descends from (v29.0.0-dev ->
+# 29.0.0), and the release is a prerelease.
+#
+# mode: all      build everything, upload with --clobber.
+#       missing  build only the groups (linux, windows, darwin, freebsd, src)
+#                the release lacks a file of, and upload only absent files.
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: 'all or missing'
+        required: true
+        type: string
+      tag:
+        description: 'Release tag (empty = a new one for "all", the newest release for "missing")'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  release:
+    name: ${{ inputs.mode == 'all' && 'build every binary' || 'build the missing groups' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream's tags
+        # The fork carries none; the version comes from the nearest upstream tag.
+        run: git fetch --quiet --force https://github.com/go-gitea/gitea.git 'refs/tags/v*:refs/tags/v*'
+
+      - name: Resolve the tag and plan the groups
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODE: ${{ inputs.mode }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -z "$TAG" ] && [ "$MODE" = "missing" ]; then
+            TAG="$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --limit 1 --json tagName --jq '.[0].tagName // empty')"
+            [ -n "$TAG" ] || { echo "::error::There is no release yet. Run Release All first."; exit 1; }
+          fi
+          if [ -z "$TAG" ]; then
+            BASE="$(git describe --tags --abbrev=0 --match 'v[0-9]*' "$GITHUB_SHA")"
+            BASE="${BASE%%-*}"
+            TAG="${BASE}-wekan-$(date -u +%Y%m%d)-${GITHUB_SHA::7}"
+          fi
+          case "${TAG#v}" in
+            *v*) echo "::error::Tag $TAG has a \"v\" after the first character; the Makefile's \$(subst v,,...) would remove it from every file name."; exit 1 ;;
+          esac
+
+          if SHA="$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha 2>/dev/null)"; then
+            echo "Tag $TAG is commit $SHA."
+          elif [ "$MODE" = "missing" ]; then
+            echo "::error::Tag $TAG does not exist, so there is no commit to complete it from."; exit 1
+          else
+            SHA="$GITHUB_SHA"
+            echo "Tag $TAG is new; it will point at $SHA."
+          fi
+          VERSION="${TAG#v}"
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | sort > existing.txt
+          else
+            : > existing.txt
+          fi
+          echo "$TAG carries $(wc -l < existing.txt | tr -d ' ') asset(s)."
+
+          # The files one release file brings: itself, its .sha256, and a
+          # .sigstore.json of each.
+          expect() { printf '%s\n' "$1" "$1.sha256" "$1.sigstore.json" "$1.sha256.sigstore.json"; }
+          PLATFORMS="$(git show "$SHA:tools/build-release.sh" | sed -n '/^RELEASE_PLATFORMS_DEFAULT=(/,/^)/p' | tr -d '()\\' | grep -oE '[a-z0-9]+/[a-z0-9-]+')"
+          [ -n "$PLATFORMS" ] || { echo "::error::No platforms found in tools/build-release.sh."; exit 1; }
+          groups=""
+          for group in linux windows darwin freebsd src; do
+            missing=0
+            if [ "$group" = src ]; then
+              files="$(expect "gitea-src-$VERSION.tar.gz")"
+            else
+              files=""
+              for p in $PLATFORMS; do
+                [ "${p%%/*}" = "$group" ] || continue
+                bin="gitea-$VERSION-${p//\//-}"; [ "$group" = windows ] && bin="$bin.exe"
+                files="$files"$'\n'"$(expect "$bin")"$'\n'"$(expect "$bin.xz")"
+              done
+            fi
+            for f in $files; do grep -qxF "$f" existing.txt || missing=$((missing + 1)); done
+            if [ "$MODE" = all ] || [ "$missing" -gt 0 ]; then
+              groups="$groups $group"
+              echo "  $group: build ($missing file(s) missing)"
+            else
+              echo "  $group: complete"
+            fi
+          done
+
+          {
+            echo "tag=$TAG"
+            echo "sha=$SHA"
+            echo "groups=${groups# }"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### $TAG ($MODE)"
+            echo ""
+            if [ -z "$groups" ]; then echo "Nothing is missing - the release is complete."
+            else echo "Building:${groups}"; fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check out the tag's commit
+        if: ${{ steps.plan.outputs.groups != '' }}
+        run: git checkout --quiet --detach "${{ steps.plan.outputs.sha }}"
+
+      - uses: actions/setup-go@v5
+        if: ${{ steps.plan.outputs.groups != '' }}
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: false
+
+      - uses: ./.github/actions/node-setup
+        if: ${{ steps.plan.outputs.groups != '' }}
+
+      - name: Build
+        if: ${{ steps.plan.outputs.groups != '' }}
+        env:
+          GROUPS: ${{ steps.plan.outputs.groups }}
+          TAG: ${{ steps.plan.outputs.tag }}
+        run: |
+          set -euo pipefail
+          make deps-frontend deps-backend
+          # Name files after the tag, as upstream's tag build does.
+          export GITHUB_REF_TYPE=tag GITHUB_REF_NAME="$TAG"
+          if [ "$GROUPS" = "linux windows darwin freebsd src" ]; then
+            make release
+          else
+            targets="frontend"
+            for g in $GROUPS; do [ "$g" = src ] || targets="$targets release-$g"; done
+            [ "$targets" = frontend ] || make $targets release-copy release-compress
+            case " $GROUPS " in *" src "*) make vendor release-sources ;; esac
+            make release-check
+          fi
+          ls -1 dist/release | sed 's/^/  /'
+
+      - name: Install Cosign
+        if: ${{ steps.plan.outputs.groups != '' }}
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign every file
+        if: ${{ steps.plan.outputs.groups != '' }}
+        run: |
+          set -euo pipefail
+          for f in dist/release/*; do
+            cosign sign-blob "$f" --bundle "$f.sigstore.json" --yes
+          done
+
+      - name: Upload to the release
+        if: ${{ steps.plan.outputs.groups != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODE: ${{ inputs.mode }}
+          TAG: ${{ steps.plan.outputs.tag }}
+          SHA: ${{ steps.plan.outputs.sha }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=( dist/release/* )
+          [ "${#files[@]}" -gt 0 ] || { echo "::error::Nothing was built in dist/release."; exit 1; }
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$SHA" --prerelease --title "$TAG" \
+              --notes "Gitea built from the wekan/gitea fork by the Release All workflow, for every platform upstream releases. Every file has a .sha256 and a keyless cosign signature (.sigstore.json) beside it."
+          fi
+          if [ "$MODE" = all ]; then
+            gh release upload "$TAG" "${files[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+            echo "Uploaded ${#files[@]} file(s) to $TAG."
+            exit 0
+          fi
+          # missing: only absent files, so a group rebuilt for one file does
+          # not replace the bytes of the others.
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | sort > existing.txt
+          new=()
+          for f in "${files[@]}"; do
+            grep -qxF "$(basename "$f")" existing.txt || new+=( "$f" )
+          done
+          if [ "${#new[@]}" -eq 0 ]; then
+            echo "::notice::$TAG already had every file the rebuilt groups produced."
+            exit 0
+          fi
+          gh release upload "$TAG" "${new[@]}" --repo "$GITHUB_REPOSITORY"
+          {
+            echo ""
+            echo "Added ${#new[@]} file(s):"
+            printf -- '- %s\n' "${new[@]#dist/release/}"
+          } >> "$GITHUB_STEP_SUMMARY"
